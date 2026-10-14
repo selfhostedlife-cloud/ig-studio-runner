@@ -1,0 +1,25 @@
+{
+  "name": "Export Import with Faizan",
+  "handle": "@faizanali.shahji",
+  "tagline": "One export-import insight. Every day.",
+  "colors": {
+    "ink": "#0A0F1E",
+    "navy": "#0B2A5B",
+    "gold": "#F5B82E",
+    "orange": "#F26A1B",
+    "white": "#FFFFFF",
+    "muted": "#9AA4B8"
+  },
+  "fonts": { "display": "Archivo Black", "body": "Inter" },
+  "slide": { "width": 1080, "height": 1080 },
+  "imageStyle": "photorealistic cinematic photo, warm natural light, Indian export-import setting (warehouse, port, factory, office), shallow depth of field, no text, no logos, no watermarks, no brand names on containers",
+  "story_rules": [
+    "Slide 1 is a hook: a person + a surprising number or a contradiction. Never a topic label.",
+    "Every slide ends with a teaser line that opens a loop for the next slide.",
+    "Build tension for 4-6 slides, then give the payoff/fix, then the CTA.",
+    "One idea per slide, max ~25 words. Gold highlights the 1-2 words that carry meaning.",
+    "Every slide has a relevant image; all type is rendered from HTML, never by the image model.",
+    "Last slide: lead magnet CTA - 'Comment KEYWORD and I'll DM you the free <asset>' plus follow.",
+    "Label invented numbers as 'illustrative example'. Real duty rates / rules must be fact-checked."
+  ]
+}

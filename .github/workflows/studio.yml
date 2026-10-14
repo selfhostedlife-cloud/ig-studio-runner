@@ -1,0 +1,79 @@
+name: studio
+
+# Scheduled runner: every ~5 minutes a run starts, handles its work for about 4.5 minutes, and queues the next run.
+# Jobs run at fixed times of day; state is committed to a separate private repository.
+# This repo holds code only. Keys are repository secrets.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: studio
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # lets a run queue the next one
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Chain: queue the next run right away (it waits in the concurrency group and starts the moment this one ends), so the bot is always on.
+      # The 5-minute cron below is only a safety net that restarts the chain if it ever breaks.
+      - name: Queue the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run studio.yml --ref main
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: renderer/package-lock.json
+
+      - name: Keys, data repo and media repo
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+          MEDIA_DEPLOY_KEY: ${{ secrets.MEDIA_DEPLOY_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN_TEST: ${{ secrets.TELEGRAM_BOT_TOKEN_TEST }}
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_key
+          printf '%s\n' "$MEDIA_DEPLOY_KEY" > ~/.ssh/media_key
+          chmod 600 ~/.ssh/data_key ~/.ssh/media_key
+          {
+            echo "Host gh-data"; echo "  HostName github.com"; echo "  User git"; echo "  IdentityFile ~/.ssh/data_key"; echo "  IdentitiesOnly yes"; echo "  StrictHostKeyChecking accept-new"
+            echo "Host gh-media"; echo "  HostName github.com"; echo "  User git"; echo "  IdentityFile ~/.ssh/media_key"; echo "  IdentitiesOnly yes"; echo "  StrictHostKeyChecking accept-new"
+          } > ~/.ssh/config
+          git clone --depth 1 git@gh-data:selfhostedlife-cloud/quartz-store.git "$RUNNER_TEMP/data"
+          mkdir -p "$RUNNER_TEMP/data/studio-data" "$RUNNER_TEMP/data/posts" out
+          ln -s "$RUNNER_TEMP/data/studio-data" studio/data
+          ln -s "$RUNNER_TEMP/data/posts" out/posts
+          git clone --depth 1 git@gh-media:selfhostedlife-cloud/ig-media.git "$RUNNER_TEMP/ig-media-work/ig-media"
+          {
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
+            echo "TELEGRAM_BOT_TOKEN_TEST=$TELEGRAM_BOT_TOKEN_TEST"
+            echo "BUFFER_API_KEY=$BUFFER_API_KEY"
+          } > .env
+          (cd renderer && npm ci --no-audit --no-fund)
+
+      - name: Studio run
+        env:
+          TICK: '1'
+          TICK_SECONDS: '270'
+          IG_ROOT: ${{ github.workspace }}
+          DATA_REPO_DIR: ${{ runner.temp }}/data
+          IG_MEDIA_WORK: ${{ runner.temp }}/ig-media-work/ig-media
+          IG_MEDIA_REMOTE: git@gh-media:selfhostedlife-cloud/ig-media.git
+          PIXABAY_KEY: ${{ secrets.PIXABAY_KEY }}
+        run: node studio/server.mjs

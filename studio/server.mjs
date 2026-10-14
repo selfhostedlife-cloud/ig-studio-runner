@@ -1,0 +1,697 @@
+// Studio service: Telegram approval bot + daily generation run + insights sync, controlled by n8n over localhost.
+// Start: node server.mjs   (see ../start-studio.cmd)
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import * as tg from './telegram.mjs';
+import { syncInsights, recentSent, sentByIds } from './insights.mjs';
+import { buildSlotModel } from './slots.mjs';
+import { pickLook, LOOKS, lookOf } from './looks.mjs';
+import { plainCheck, plainHooksFor } from './plain.mjs';
+import { gemini } from './agents.mjs';
+import { feed, cleanupMedia } from './feeder.mjs';
+import { persist, pruneImages, squashHistory } from './cloud.mjs';
+const TICK = process.env.TICK === '1'; // cloud mode: one bounded run (GitHub Actions), no HTTP server, no timers
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.join(here, '..');
+const dataDir = path.join(here, 'data');
+const stateFile = path.join(dataDir, 'state.json');
+const PORT = 5688;
+const SLOTS = ['12:30', '19:00']; // IST slots, from your own posting history
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- secrets ----------
+const envFile = path.join(root, '.env');
+let env = fs.readFileSync(envFile, 'utf8');
+if (!/^STUDIO_TOKEN=/m.test(env)) { fs.appendFileSync(envFile, `\nSTUDIO_TOKEN=${crypto.randomBytes(24).toString('hex')}\n`); env = fs.readFileSync(envFile, 'utf8'); }
+const STUDIO_TOKEN = env.match(/^STUDIO_TOKEN=(.*)$/m)[1].trim();
+
+// ---------- state ----------
+const loadState = () => { try { return JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { return {}; } };
+let state = Object.assign({ posts: [], chatId: null, offset: 0, seq: 0 }, loadState());
+let dirty = false;
+const save = () => { fs.writeFileSync(stateFile, JSON.stringify(state, null, 2)); dirty = true; };
+// post folders are stored as absolute paths of whichever machine saved last: re-point them to this machine by folder name
+for (const p of state.posts) if (p.dir && !fs.existsSync(p.dir)) { const cand = path.join(root, 'out', 'posts', String(p.dir).split(/[\\/]/).pop()); if (fs.existsSync(cand)) p.dir = cand; }
+// background jobs started by commands (daily run, results image, learning...): a cloud run must wait for them before it exits
+const bgTasks = new Set();
+const bg = (p) => { const q = Promise.resolve(p).catch(() => {}); bgTasks.add(q); q.finally(() => bgTasks.delete(q)); return p; };
+const byNo = (n) => state.posts.find((p) => p.no === Number(n));
+const BOTS = { main: tg.mainBot, test: tg.testBot };
+state.chats ||= {}; if (state.chatId && !state.chats.main) state.chats.main = state.chatId;
+state.offsets ||= {}; if (state.offset && state.offsets.main == null) state.offsets.main = state.offset;
+// One bot per account. An account is served by its own bot when that bot is configured and paired; otherwise by the main bot (prefixed so you can tell).
+const botFor = (acct) => (acct === 'test' && BOTS.test.hasToken() && state.chats.test ? 'test' : 'main');
+const sendTo = (acct, text, extra) => {
+  const who = botFor(acct); const chat = state.chats[who];
+  if (!chat) { log('(unpaired) ' + String(text).slice(0, 80)); return null; }
+  const t = who === 'main' && acct === 'test' ? '[TEST account] ' + text : text;
+  return BOTS[who].sendMessage(chat, t, extra).catch((e) => log('send failed:', e.message));
+};
+const photoTo = (acct, file, caption, markup) => {
+  const who = botFor(acct); const chat = state.chats[who];
+  if (!chat) return null;
+  return BOTS[who].sendPhoto(chat, file, (who === 'main' && acct === 'test' ? '[TEST account] ' : '') + (caption || ''), markup).catch((e) => log('photo failed:', e.message));
+};
+const say = (text, extra) => sendTo('main', text, extra);
+const ans = (cb, text) => BOTS[cb._who || 'main'].answerCallback(cb.id, text);
+
+// ---------- child process runner ----------
+let browserReady = !TICK;
+function ensureBrowser(script) { // cloud: install Chromium (and its system libraries) only when a script that renders is about to run
+  if (browserReady || !/render|results-image|make-from|restyle|mimic|reference|looks|leadmagnet|data-/.test(script)) return;
+  const r = spawnSync('npx', ['playwright', 'install', '--with-deps', 'chromium'], { cwd: path.join(root, 'renderer'), encoding: 'utf8', timeout: 10 * 60e3 });
+  log('chromium install exit', r.status); browserReady = true;
+}
+function run(script, args = [], timeoutMs = 15 * 60e3) {
+  return new Promise((resolve) => {
+    ensureBrowser(script);
+    const p = spawn(process.execPath, [path.join(here, script), ...args], { cwd: here });
+    let out = '', err = '';
+    const t = setTimeout(() => p.kill(), timeoutMs);
+    p.stdout.on('data', (b) => (out += b)); p.stderr.on('data', (b) => (err += b));
+    p.on('close', (code) => { clearTimeout(t); resolve({ code, out, err }); });
+  });
+}
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
+
+// ---------- slots ----------
+function nextSlot() { // only a suggestion shown at approval: the next peak slot of the main account (the feeder picks the real slot per account)
+  const taken = new Set(state.posts.filter((p) => p.dueAt && p.status !== 'rejected').map((p) => new Date(p.dueAt).toISOString()));
+  const model = readJson(path.join(dataDir, 'slot-model.json'), null)?.accounts?.main?.slots;
+  for (let d = 0; d < 30; d++) {
+    const day = new Date(Date.now() + 5.5 * 3600e3 + d * 864e5);
+    for (const s of (model ? model[day.getUTCDay()] : SLOTS) || SLOTS) {
+      const date = day.toISOString().slice(0, 10); // IST calendar date
+      const iso = new Date(`${date}T${s}:00+05:30`).toISOString();
+      if (new Date(iso).getTime() > Date.now() + 45 * 60e3 && !taken.has(iso)) return { iso, label: `${date} ${s} IST` };
+    }
+  }
+}
+
+// ---------- preview ----------
+const kb = (n) => ({ inline_keyboard: [
+  [{ text: 'Approve', callback_data: `a:${n}` }, { text: 'Reject', callback_data: `r:${n}` }],
+  [1, 2, 3, 4].map((s) => ({ text: `Swap img ${s}`, callback_data: `s:${n}:${s}` })),
+  [5, 6, 7].map((s) => ({ text: `Swap img ${s}`, callback_data: `s:${n}:${s}` })),
+  [{ text: 'Caption', callback_data: `c:${n}` }, { text: 'Facts to check', callback_data: `f:${n}` }, { text: 'PDF', callback_data: `d:${n}` }],
+] });
+
+async function sendPreview(post) {
+  if (!state.chatId) { log('cannot preview: not paired yet'); return; }
+  const slides = fs.readdirSync(post.dir).filter((f) => /^slide_\d+\.jpg$/.test(f)).sort().map((f) => path.join(post.dir, f));
+  const review = readJson(path.join(post.dir, 'review.json'), {});
+  await tg.sendAlbum(state.chatId, slides, `#${post.no} ${post.topic}`);
+  const unver = review.factcheck?.unverified ? 'NOT fact-checked (search quota). Review the claims.' : (review.factcheck?.ok ? 'Fact-check passed.' : 'Fact-check flagged issues.');
+  const slot = nextSlot();
+  const sc = review.scores || {};
+  const warns = [];
+  if (Object.values(sc).some((v) => Number(v) <= 2)) warns.push('Critic scored this 2/5 or lower on: ' + Object.entries(sc).filter(([, v]) => Number(v) <= 2).map(([k]) => k).join(', '));
+  if ((review.promise?.gaps || []).length) warns.push('CTA promises something the PDF does not deliver: ' + review.promise.gaps.join('; '));
+  if (review.factcheck?.issues?.length) warns.push('Fact-check flagged ' + review.factcheck.issues.length + ' item(s). Tap "Facts to check".');
+  await tg.sendMessage(state.chatId,
+    `${warns.length ? 'WARNING - review before approving:\n- ' + warns.join('\n- ') + '\n\n' : ''}Post #${post.no}: ${post.topic}\nHook: ${post.hook}\nOffer: comment "${post.keyword}" -> ${post.leadmagnet || 'PDF'}\n${unver}\nSuggested slot: ${slot.label}\nScores: ${JSON.stringify(review.scores || {})}`,
+    { reply_markup: kb(post.no) });
+}
+
+// ---------- Drive: approved lead magnets go into the shared "Freebies for IG Studio" folder (Drive for desktop syncs it) ----------
+const DRIVE_DIR = 'H:/My Drive/Freebies for IG Studio';
+function copyToDrive(post) {
+  try {
+    if (!fs.existsSync(DRIVE_DIR)) return TICK ? 'PDF saved in the cloud copy; it reaches your Drive folder the next time the laptop syncs (or add it by hand)' : 'Drive folder not mounted (sign in to Drive for desktop)';
+    const pdf = fs.readdirSync(post.dir).find((f) => f.endsWith('.pdf'));
+    if (!pdf) return 'no PDF found';
+    const title = (readJson(path.join(post.dir, 'leadmagnet.json'), {}).title || pdf.replace(/.pdf$/, '')).replace(/[\/:*?"<>|]/g, '');
+    const name = String(post.keyword).toUpperCase() + ' - ' + title + '.pdf';
+    fs.copyFileSync(path.join(post.dir, pdf), path.join(DRIVE_DIR, name));
+    return 'copied to Drive as "' + name + '"';
+  } catch (e) { return 'Drive copy failed: ' + e.message; }
+}
+
+// ---------- feeder: bank -> Buffer ----------
+let feeding = false;
+async function runFeed(dryRun = false) {
+  if (feeding) return { busy: true };
+  feeding = true;
+  try {
+    const out = await feed(state, save, { dryRun, notify: (t, acct) => sendTo(acct || 'main', t) });
+    if (!dryRun) out.cleanup = await cleanupMedia(state, save);
+    return out;
+  } finally { feeding = false; }
+}
+
+// ---------- commands: help, /look, /hook ----------
+const HELP_MAIN = [
+  'MAIN BOT COMMANDS',
+  '/status - the last posts and when each goes live',
+  '/results - results chart for the main account',
+  '/run - write new posts now (normally automatic at 11:30)',
+  '/learn - re-read all results and update what the system does next',
+  '/hook 17 - 5 plain-English hook options for post #17 (tap one to put it on the cover and caption)',
+  '/fix 18 2 <what you want> - rewrite the TEXT of slide 2 of post #18, e.g. /fix 18 2 Mistake is shipping on 100% DP to a new buyer, Fix is taking part advance. (Swap img only changes the photo.)',
+  '/fresh 17 - new plain hook AND new design for post #17 in one go',
+  '/look 17 - change post #17 to the next design look; /look 17 red-news picks one; /looks lists them',
+  '/ref - how to copy a competitor post',
+  '',
+  'COPY A COMPETITOR POST: select ALL its slides as screenshots and send them together in one message (a note in the caption is optional, e.g. "keep it shorter"). I read its hook, structure, caption style, colours and font and send back a NEW post in the same style with one better tweak: slides, caption and PDF. Approve it and it goes to the front of the queue. An Instagram link alone cannot be read by any tool, so the screenshots are needed.',
+  '',
+  'The test bot (@exportimportwithfaizan) only has /status and /results.',
+].join('\n');
+
+async function onLookCommand(text, reply) {
+  const [, no, name] = text.split(/\s+/);
+  const post = byNo(no); if (!post) return reply('Usage: /look 17  or  /look 17 red-news  (see /looks)');
+  if ((post.buffer || []).length) return reply('#' + post.no + ' is already in Buffer, so its slides cannot change here.');
+  const cur = lookOf(post);
+  const pick = name || pickLook([...state.posts.filter((p) => p.no !== post.no), { ...post, look: cur }]);
+  if (!LOOKS[pick]) return reply('Unknown look. Choose one of: ' + Object.keys(LOOKS).join(', '));
+  await reply('Changing #' + post.no + ' to the "' + pick + '" look (about a minute)...');
+  const r = await run('looks.mjs', ['apply', post.dir, pick], 10 * 60e3);
+  if (r.code !== 0) return reply('Look failed: ' + r.err.slice(-200));
+  post.look = pick; save();
+  await sendPreview(post);
+}
+
+const hlNum = (t) => (/==/.test(t) ? t : t.replace(/(\bRs\.?\s?\d[\d,.]*(?:\s?(?:lakh|crore|k|L|Cr)\b)?|\b\d[\d,.]*\s?%|\b\d+\s(?:days|weeks|months|years|hours|things|steps|mistakes|documents)\b)/i, '==$1=='));
+async function onHookCommand(text, reply) {
+  const post = byNo(text.split(/\s+/)[1]);
+  if (!post) return reply('Usage: /hook 17  (the post number from the preview)');
+  if ((post.buffer || []).length) return reply('#' + post.no + ' is already in Buffer, so its cover cannot change here.');
+  await reply('Writing plain-English hooks for #' + post.no + '...');
+  const spec = readJson(path.join(post.dir, 'spec.json'), { slides: [] });
+  let caption = ''; try { caption = fs.readFileSync(path.join(post.dir, 'caption.txt'), 'utf8'); } catch { /* none */ }
+  const opts = await plainHooksFor({ topic: post.topic, current: post.hook, facts: { slides: spec.slides.map((s) => [s.title, s.sub, s.text, s.stat, ...(s.items || [])].filter(Boolean).join(' | ')), caption } });
+  if (!opts.length) return reply('No options came back (Gemini quota?). Try again later.');
+  post.hookOptions = opts; save();
+  return BOTS.main.sendMessage(state.chats.main, 'Hooks for #' + post.no + ' (now: "' + post.hook + '")\n\n' + opts.map((o, i) => (i + 1) + '. ' + o.hook + '\n    ' + (o.sub || '')).join('\n') + '\n\nTap one to put it on the cover and the first line of the caption.', { reply_markup: { inline_keyboard: opts.map((o, i) => [{ text: (i + 1) + '. ' + o.hook.slice(0, 55), callback_data: 'h:' + post.no + ':' + i }]) } });
+}
+async function applyHook(post, opt, { quiet = false } = {}) {
+  const size = (t) => { const len = String(t).length; return len > 70 ? 60 : len > 50 ? 70 : len > 32 ? 82 : 96; };
+  for (const f of ['spec.json', 'spec.pre-look.json']) {
+    const file = path.join(post.dir, f); const sp = readJson(file, null); if (!sp) continue;
+    const c = sp.slides.find((s) => s.type === 'cover') || sp.slides[0];
+    c.title = hlNum(opt.hook); if (opt.sub) { c.sub = opt.sub; if (c.layout) c.text = opt.sub; } if (c.layout) c.size = size(opt.hook);
+    fs.writeFileSync(file, JSON.stringify(sp, null, 2));
+  }
+  try { const cf = path.join(post.dir, 'caption.txt'); const lines = fs.readFileSync(cf, 'utf8').split('\n'); lines[0] = opt.hook; fs.writeFileSync(cf, lines.join('\n')); } catch { /* caption missing */ }
+  post.hook = opt.hook; save();
+  const r = await run('../renderer/render.mjs', [path.join(post.dir, 'spec.json'), post.dir, '--only', '1'], 5 * 60e3);
+  if (r.code !== 0) throw new Error(r.err.slice(-200));
+  if (quiet) return;
+  await tg.sendPhoto(state.chatId, path.join(post.dir, 'slide_01.jpg'), '#' + post.no + ' new cover: ' + opt.hook, { inline_keyboard: [[{ text: 'Approve', callback_data: 'a:' + post.no }, { text: 'Other hooks', callback_data: 'x:' + post.no }]] });
+}
+
+// new plain hook + next look in one go (for posts that wait for approval or sit in the bank)
+async function refreshPost(post) {
+  if ((post.buffer || []).length) throw new Error('#' + post.no + ' is already in Buffer');
+  const spec = readJson(path.join(post.dir, 'spec.json'), { slides: [] });
+  let caption = ''; try { caption = fs.readFileSync(path.join(post.dir, 'caption.txt'), 'utf8'); } catch { /* none */ }
+  const opts = await plainHooksFor({ topic: post.topic, current: post.hook, facts: { slides: spec.slides.map((s) => [s.title, s.sub, s.text, s.stat, ...(s.items || [])].filter(Boolean).join(' | ')), caption } });
+  if (!opts.length) throw new Error('no hook options (Gemini quota?)');
+  const opt = opts.find((o) => plainCheck(o.hook).ok) || opts[0];
+  await applyHook(post, opt, { quiet: true });
+  const pick = pickLook(state.posts.filter((p) => p.no !== post.no));
+  const r = await run('looks.mjs', ['apply', post.dir, pick], 10 * 60e3);
+  if (r.code !== 0) throw new Error('look failed: ' + r.err.slice(-200));
+  post.look = pick; post.hookOptions = opts; save();
+  await sendPreview(post);
+  return { no: post.no, hook: post.hook, look: pick };
+}
+
+// /fix <post> <slide> <instruction>: the owner says what a slide should say; the slide text is rewritten (facts of the post only) and re-rendered
+async function fixSlide(post, slideNo, instruction) {
+  const spec = readJson(path.join(post.dir, 'spec.json'), null); const idx = slideNo - 1;
+  if (!spec?.slides?.[idx]) throw new Error('post #' + post.no + ' has no slide ' + slideNo);
+  const cur = spec.slides[idx];
+  const out = await gemini(`You edit ONE slide of an Instagram carousel for Indian exporters, exactly as the owner asks.
+OWNER'S INSTRUCTION: ${instruction}
+CURRENT SLIDE ${slideNo}: ${JSON.stringify({ title: cur.title, text: cur.text, items: cur.items, teaser: cur.teaser })}
+ALL SLIDES OF THE POST (for facts and context): ${JSON.stringify(spec.slides.map((s, i) => ({ n: i + 1, title: s.title, text: s.text, items: s.items })))}
+RULES: plain easy English (short sentences, everyday words, max 12 words per line). Do NOT invent numbers or new claims; use only what the post already says plus the owner's instruction. title = max 7 words, only the headline, never the body. text = the body, ONE point per line separated by \\n, blank line (\\n\\n) between groups. Markup: ==x== yellow highlight (numbers), ++x++ purple highlight, !!x!! orange (ONLY for the word Mistake:). At most 2 highlights. For a Mistake/Fix slide use exactly: "!!Mistake:!!\\n<what the exporter did wrong>\\n\\n++Fix:++\\n<the action that prevents it>". A Fix is what to DO next time, never the bad outcome.
+Return JSON: {"title":"","text":"","items":[],"teaser":""} (teaser max 6 words; keep the current teaser if it still fits).`);
+  if (!out?.title) throw new Error('no rewrite came back (Gemini quota?)');
+  const size = (t) => { const len = String(t).length; return len > 70 ? 60 : len > 50 ? 70 : len > 32 ? 82 : 96; };
+  for (const f of ['spec.json', 'spec.pre-look.json']) {
+    const file = path.join(post.dir, f); const sp = readJson(file, null); if (!sp?.slides?.[idx]) continue;
+    const s = sp.slides[idx]; s.title = out.title; s.text = out.text || ''; if (out.items?.length) s.items = out.items; else if (!s.layout) s.items = s.items || [];
+    if (out.teaser) s.teaser = out.teaser; if (s.layout) delete s.size;
+    fs.writeFileSync(file, JSON.stringify(sp, null, 2));
+  }
+  const r = await run('../renderer/render.mjs', [path.join(post.dir, 'spec.json'), post.dir, '--only', String(slideNo), '--keep-photos'], 5 * 60e3);
+  if (r.code !== 0) throw new Error(r.err.slice(-200));
+  await tg.sendPhoto(state.chatId, path.join(post.dir, 'slide_' + String(slideNo).padStart(2, '0') + '.jpg'), '#' + post.no + ' slide ' + slideNo + ' rewritten', { inline_keyboard: [[{ text: 'Approve', callback_data: 'a:' + post.no }]] });
+  return { no: post.no, slide: slideNo, title: out.title, text: out.text };
+}
+async function onFixCommand(text, reply) {
+  const m = text.match(/^\/fix\s+(\d+)\s+(\d+)\s+([\s\S]+)/); const post = m && byNo(m[1]);
+  if (!m || !post) return reply('Usage: /fix 18 2 what you want on that slide\nExample: /fix 18 2 Mistake: shipping on 100% DP to a new buyer. Fix: take part payment in advance.');
+  if ((post.buffer || []).length) return reply('#' + post.no + ' is already in Buffer, so its slides cannot change here.');
+  await reply('Rewriting slide ' + m[2] + ' of #' + post.no + '...');
+  return fixSlide(post, Number(m[2]), m[3].trim()).catch((e) => reply('Could not rewrite: ' + e.message));
+}
+
+// ---------- handlers ----------
+async function onApprove(post, cb) {
+  const slot = nextSlot();
+  post.status = 'approved'; post.dueAt = slot.iso; post.approvedAt = new Date().toISOString(); save();
+  const out = path.join(root, 'out', 'approved', path.basename(post.dir));
+  fs.mkdirSync(out, { recursive: true });
+  for (const f of fs.readdirSync(post.dir)) if (/^slide_\d+\.jpg$|\.pdf$|^caption\.txt$/.test(f)) fs.copyFileSync(path.join(post.dir, f), path.join(out, f));
+  await ans(cb, 'Approved');
+  const driveNote = copyToDrive(post);
+  const caption = fs.readFileSync(path.join(post.dir, 'caption.txt'), 'utf8').trim();
+  const bank = state.posts.filter((p) => p.status === 'approved' && !(p.buffer || []).length).length;
+  await say(`Approved #${post.no} - added to the bank (${bank} approved waiting${bank > BANK_TARGET ? '; more than ' + BANK_TARGET + ' means the oldest were written with older learnings, so approve fewer at a time' : ''}).\nLead magnet: ${driveNote}.\nThe feeder puts it into Buffer on both accounts as soon as slots are free (checked every 30 min). You get a message when it is queued and another when it goes live.`);
+  bg(runFeed().catch((e) => log('feed error:', e.message)));
+}
+
+async function onSwap(post, slide, cb) {
+  const specFile = path.join(post.dir, 'spec.json');
+  const spec = readJson(specFile, null);
+  if (!spec || !spec.slides[slide - 1]) return ans(cb, 'No such slide');
+  spec.slides[slide - 1].imageSkip = (spec.slides[slide - 1].imageSkip || 0) + 1;
+  fs.writeFileSync(specFile, JSON.stringify(spec, null, 2));
+  await ans(cb, `Swapping image ${slide}...`);
+  const r = await run('../renderer/render.mjs', [specFile, post.dir, '--only', String(slide)], 3 * 60e3);
+  if (r.code !== 0) return say(`Swap failed: ${r.err.slice(0, 200)}`);
+  await tg.sendPhoto(state.chatId, path.join(post.dir, `slide_${String(slide).padStart(2, '0')}.jpg`), `#${post.no} slide ${slide} with a new photo`, { inline_keyboard: [[{ text: `Swap img ${slide} again`, callback_data: `s:${post.no}:${slide}` }, { text: 'Approve', callback_data: `a:${post.no}` }]] });
+}
+
+async function onCallback(cb) {
+  if (!Object.values(state.chats).map(String).includes(String(cb.message?.chat?.id))) return ans(cb, 'Not authorised');
+  const [kind, no, extra] = String(cb.data).split(':');
+  const post = byNo(no);
+  if (!post) return ans(cb, 'Unknown post');
+  if (kind === 'a') return onApprove(post, cb);
+  if (kind === 'r') { post.status = 'rejected'; save(); await ans(cb, 'Rejected'); return say(`Rejected #${post.no}. Tell me why in one line (reply to this message) and I will remember it.`, { reply_markup: { force_reply: true } }); }
+  if (kind === 'm') {
+    post.music ||= {}; const m = (post.music[extra] ||= {});
+    m.added = true; m.addedAt = new Date().toISOString(); m.delayMin = m.liveAt ? Math.round((Date.now() - new Date(m.liveAt).getTime()) / 60e3) : null; save();
+    return ans(cb, 'Recorded - the model will learn from music vs no music');
+  }
+  if (kind === 's') return onSwap(post, Number(extra), cb);
+  if (kind === 'x') { await ans(cb); return onHookCommand('/hook ' + post.no, (t, x) => BOTS.main.sendMessage(state.chats.main, t, x)); }
+  if (kind === 'h') { const opt = (post.hookOptions || [])[Number(extra)]; if (!opt) return ans(cb, 'Option expired, send /hook ' + post.no + ' again'); await ans(cb, 'Applying...'); return applyHook(post, opt).catch((e) => say('Could not apply the hook: ' + e.message)); }
+  if (kind === 'c') { await ans(cb); return say(fs.readFileSync(path.join(post.dir, 'caption.txt'), 'utf8')); }
+  if (kind === 'f') {
+    await ans(cb);
+    const rv = readJson(path.join(post.dir, 'review.json'), {});
+    return say(`Facts to verify for #${post.no}:\n- ${(rv.claims || []).join('\n- ')}\n\n${rv.factcheck?.unverified ? 'None of these were auto-checked (search quota).' : (rv.factcheck?.issues?.length ? 'Flagged:\n' + rv.factcheck.issues.join('\n') : 'Auto-check found no problems.')}`);
+  }
+  if (kind === 'd') { await ans(cb); const pdf = fs.readdirSync(post.dir).find((f) => f.endsWith('.pdf')); return pdf ? tg.sendDocument(state.chatId, path.join(post.dir, pdf), `Lead magnet for "${post.keyword}"`) : say('No PDF found'); }
+}
+
+async function onMessage(m, who = 'main') {
+  const chat = m.chat.id, text = (m.text || '').trim();
+  const reply = (t, x) => BOTS[who].sendMessage(chat, t, x);
+  if (!state.chats[who] && text.startsWith('/start')) {
+    state.chats[who] = chat; if (who === 'main') state.chatId = chat; save(); log('paired', who, 'bot with chat', chat);
+    return reply(who === 'test'
+      ? 'Paired. This bot carries everything about the TEST account @exportimportwithfaizan: what is queued, go-live alerts with the post link and the music reminder, and its results charts.\nCommands: /status, /results'
+      : 'Paired. This is the MAIN bot (@faizanali.shahji): approvals of new posts, reference posts you send me, queue, go-live alerts, music reminders and results charts.\nCommands: /status, /results, /run, /learn, /help');
+  }
+  if (String(chat) !== String(state.chats[who])) return reply('This bot is private.');
+  if (who === 'main' && m.reply_to_message && m.reply_to_message.text?.startsWith('Rejected #')) {
+    const no = Number(m.reply_to_message.text.match(/#(\d+)/)[1]); const p = byNo(no);
+    if (p) { p.rejectReason = text; save(); const f = path.join(dataDir, 'feedback.json'); const fb = readJson(f, []); fb.push({ at: new Date().toISOString(), topic: p.topic, hook: p.hook, reason: text }); fs.writeFileSync(f, JSON.stringify(fb, null, 2)); }
+    return reply('Noted. I will avoid that next time.');
+  }
+  if (who === 'main' && (m.photo || (m.document && /^image\//.test(m.document.mime_type || '')))) return collectReference(m);
+  if (who === 'main' && /https?:\/\/\S+/.test(text)) return onReferenceLink(text.match(/https?:\/\/\S+/)[0], reply);
+  if (who === 'main' && (text === '/ref' || text === '/help')) return reply(HELP_MAIN);
+  if (who === 'main' && /^\/looks\b/.test(text)) return reply('Design looks (each new post rotates to a look not used in the last 4 posts):\n' + Object.entries(LOOKS).map(([k, v]) => '- ' + k + ': ' + v.label).join('\n') + '\n\nChange one post: /look 17 (next look in the rotation) or /look 17 red-news');
+  if (who === 'main' && /^\/fix\b/.test(text)) return onFixCommand(text, reply);
+  if (who === 'main' && /^\/fresh\b/.test(text)) { const p = byNo(text.split(/\s+/)[1]); if (!p) return reply('Usage: /fresh 17 (new plain hook + new design for post #17)'); reply('Refreshing #' + p.no + ' (hook + design), about 2 minutes...'); return refreshPost(p).catch((e) => reply('Refresh failed: ' + e.message)); }
+  if (who === 'main' && /^\/look\b/.test(text)) return onLookCommand(text, reply);
+  if (who === 'main' && /^\/hook\b/.test(text)) return onHookCommand(text, reply);
+  if (text === '/status') {
+    const acct = who;
+    const lines = state.posts.slice(-8).map((p) => {
+      const e = (p.buffer || []).find((x) => String(x.account).startsWith(acct));
+      const when = e?.dueAt || (who === 'main' ? p.dueAt : null);
+      return `#${p.no} [${p.status}] ${p.topic}${when ? ' | ' + new Date(when).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }) + ' IST' : ''}`;
+    });
+    return reply(lines.join('\n') || 'No posts yet.');
+  }
+  if (text === '/results') { bg(sendResults(who).catch((e) => reply('Could not build the results image: ' + e.message))); return reply('Building your results chart...'); }
+  if (who === 'main' && text === '/learn') { bg(relearn(true).catch((e) => say('Learning failed: ' + e.message))); return reply('Re-analysing all results...'); }
+  if (who === 'main' && text === '/run') { bg(dailyRun(2, { force: true }).catch((e) => say('Daily run failed: ' + e.message))); return reply('Starting a daily run. This takes several minutes.'); }
+  return reply(who === 'main' ? HELP_MAIN : 'Commands on this bot: /status (the queue of this account), /results (results chart). Everything else is on the main bot.');
+}
+
+async function pollLoop(who = 'main') {
+  const bot = BOTS[who];
+  if (!bot.hasToken()) return log('no token for the ' + who + ' bot; polling disabled' + (who === 'test' ? ' (set TELEGRAM_BOT_TOKEN_TEST in .env)' : ''));
+  log(who, 'telegram polling started', state.chats[who] ? '(paired)' : '(waiting for /start)');
+  for (;;) {
+    try {
+      const updates = await bot.getUpdates(state.offsets[who] || 0, 25);
+      for (const u of updates) {
+        state.offsets[who] = u.update_id + 1;
+        try { if (u.callback_query) { u.callback_query._who = who; await onCallback(u.callback_query); } else if (u.message) await onMessage(u.message, who); }
+        catch (e) { log('handler error:', e.message); }
+      }
+      if (updates.length) save();
+    } catch (e) { log('poll error:', e.message); await sleep(e.message.includes('Conflict') ? 30000 : 5000); }
+  }
+}
+
+// ---------- daily run ----------
+let running = false;
+// Bank cap: every post waiting (approved-not-queued + awaiting approval) was written with older knowledge, so keep that pile small
+// and refill it only as it drains. Automatic runs obey the cap; a manual /run from Telegram bypasses it.
+const BANK_TARGET = 4;
+const pipelineSize = () => state.posts.filter((p) => (p.status === 'approved' && !(p.buffer || []).length) || p.status === 'awaiting_approval').length;
+const DAILY_AT = { h: 11, m: 30 }; // IST; n8n triggers it, the studio catches up if the laptop was off at that time
+const istNow = () => new Date(Date.now() + 5.5 * 3600e3);
+const istDate = () => istNow().toISOString().slice(0, 10);
+const ranToday = () => state.lastDailyRunDate === istDate();
+// first start with this feature: a post already drafted today counts as today's run
+if (!state.lastDailyRunDate) { const last = state.posts.map((p) => p.createdAt).filter(Boolean).sort().pop(); if (last) state.lastDailyRunDate = new Date(new Date(last).getTime() + 5.5 * 3600e3).toISOString().slice(0, 10); }
+async function dailyRun(count = 2, { force = false } = {}) {
+  if (running) return { started: false, reason: 'already running' };
+  if (!force) {
+    if (ranToday()) return { started: false, reason: 'already ran today' };
+    state.lastDailyRunDate = istDate(); save();
+    const room = BANK_TARGET - pipelineSize();
+    if (room <= 0) { log(`daily run skipped: ${pipelineSize()} posts already waiting (cap ${BANK_TARGET})`); await say(`Daily run skipped: ${pipelineSize()} posts are already waiting for approval or a slot (cap ${BANK_TARGET}). Approve or reject those first - newer posts are written with newer learnings.`); return { started: false, reason: 'bank full' }; }
+    count = Math.min(count, room);
+  }
+  running = true;
+  try {
+    await say(`Daily run started (${count} carousels). I will send previews here.`);
+    const used = new Set(state.posts.map((p) => (p.keyword || '').toUpperCase()));
+    const c = await run('concepts.mjs', [String(count + 3)]);
+    if (c.code !== 0) throw new Error('concept planning failed: ' + c.err.slice(-300));
+    const concepts = readJson(path.join(dataDir, 'concepts-latest.json'), { concepts: [] }).concepts;
+    const picks = [];
+    concepts.forEach((x, i) => { if (picks.length < count && x.offer?.keyword && !used.has(String(x.offer.keyword).toUpperCase())) picks.push(i + 1); });
+    if (!picks.length) throw new Error('no fresh concepts (all keywords already used)');
+    const h = await run('hooks.mjs', picks.map(String));
+    if (h.code !== 0) throw new Error('hooks failed: ' + h.err.slice(-300));
+    const hk = readJson(path.join(dataDir, 'hooks-latest.json'), { hooks: [] });
+    const hooks = Array.isArray(hk) ? hk : (hk.hooks || Object.values(hk).find(Array.isArray) || []);
+    for (const no of picks) {
+      const hs = hooks.find((x) => Number(x.concept) === no);
+      const best = hs?.options?.[hs?.best_index ?? 0]; const opt = (best && plainCheck(best.hook).ok ? best : (hs?.options || []).find((o) => plainCheck(o.hook).ok)) || best || hs?.options?.[0]; // plain English first
+      if (!opt) { await say(`Skipped concept ${no}: no hook.`); continue; }
+      const sub = /comment|dm\b/i.test(opt.sub || '') ? 'Illustrative case. Here is what to check before it happens to you.' : opt.sub;
+      const r = await run('make-from-concept.mjs', [String(no), '--hook', opt.hook, '--sub', sub]);
+      if (r.code !== 0) { await say(`Generation failed for concept ${no}: ${r.err.slice(-200)}`); continue; }
+      const info = JSON.parse(r.out.trim().slice(r.out.indexOf('{')));
+      const concept = concepts[no - 1];
+      let lookName = 'ink-gold'; // design rotation: never one of the last 4 looks
+      try { lookName = pickLook(state.posts); if (lookName !== 'ink-gold') { const lr = await run('looks.mjs', ['apply', info.outDir, lookName], 10 * 60e3); if (lr.code !== 0) throw new Error(lr.err.slice(-200)); } } catch (e) { log('look failed, keeping the original look:', e.message); lookName = 'ink-gold'; }
+      const post = { no: ++state.seq, id: info.id, dir: info.outDir, topic: concept.title, hook: opt.hook, keyword: info.keyword, leadmagnet: path.basename(info.pdf || ''), look: lookName, status: 'awaiting_approval', createdAt: new Date().toISOString() };
+      state.posts.push(post); save();
+      await sendPreview(post);
+    }
+    return { started: true };
+  } catch (e) { await say('Daily run failed: ' + e.message + '\nSend /run to try again.'); throw e; }
+  finally { running = false; }
+}
+
+// ---------- reference posts: owner sends slides of a post that worked, the studio builds a similar-but-better one ----------
+let refBuf = null; let referenceRunning = false;
+function collectReference(m) {
+  if (TICK) { // persisted buffer: slides of one album arrive in the same run or the next one
+    state.refBuf ||= { items: [], caption: '' }; const b = state.refBuf;
+    b.items.push({ id: m.message_id, fileId: m.photo ? m.photo[m.photo.length - 1].file_id : m.document.file_id, ext: m.document ? (path.extname(m.document.file_name || '') || '.jpg') : '.jpg' });
+    if (m.caption) b.caption = m.caption; b.at = Date.now(); save(); return;
+  }
+  refBuf ||= { items: [], caption: '' };
+  const fileId = m.photo ? m.photo[m.photo.length - 1].file_id : m.document.file_id;
+  refBuf.items.push({ id: m.message_id, fileId, ext: m.document ? (path.extname(m.document.file_name || '') || '.jpg') : '.jpg' });
+  if (m.caption) refBuf.caption = m.caption;
+  clearTimeout(refBuf.timer);
+  refBuf.timer = setTimeout(() => { const b = refBuf; refBuf = null; startReference(b).catch((e) => say('Reference job failed: ' + e.message)); }, 10000); // wait 10s for the rest of the slides
+}
+async function onReferenceLink(url, reply) {
+  if (!/instagram\.com|instagr\.am/i.test(url)) {
+    try { // other pages: try the public preview image
+      const html = await (await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 Chrome/124' }, signal: AbortSignal.timeout(15000) })).text();
+      const og = (html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i) || [])[1];
+      if (og) {
+        const jobDir = path.join(root, 'out', 'reference', Date.now().toString(36)); fs.mkdirSync(jobDir, { recursive: true });
+        const f = path.join(jobDir, 'ref_01.jpg'); fs.writeFileSync(f, Buffer.from(await (await fetch(og.replace(/&amp;/g, '&'))).arrayBuffer()));
+        const cap = (html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)/i) || [])[1] || '';
+        await reply('Found one preview image on that page. Building from it (a single image gives me less to copy than a full set of slides).');
+        return runReferenceJob(jobDir, [f], cap, url);
+      }
+    } catch { /* fall through to the explanation */ }
+  }
+  state.pendingRef = { url, at: Date.now() }; save();
+  return reply("I can't read a post from its link: Instagram shows scripts nothing without a login (I tested your own public posts, and I won't put your password in a bot). Please send the slides as screenshots/photos, all together in one message, and I'll build from them. I kept the link as the source.");
+}
+async function startReference(b) {
+  const jobDir = path.join(root, 'out', 'reference', Date.now().toString(36)); fs.mkdirSync(jobDir, { recursive: true });
+  const files = [];
+  for (const [i, it] of b.items.sort((x, y) => x.id - y.id).slice(0, 10).entries()) files.push(await tg.mainBot.downloadFile(it.fileId, path.join(jobDir, 'ref_' + String(i + 1).padStart(2, '0') + it.ext)));
+  const url = state.pendingRef && Date.now() - state.pendingRef.at < 30 * 60e3 ? state.pendingRef.url : null;
+  return runReferenceJob(jobDir, files, b.caption, url);
+}
+async function runReferenceJob(jobDir, files, note, url) {
+  if (referenceRunning) return say('A reference post is still being built. Send this one again in a few minutes.');
+  referenceRunning = true;
+  try {
+    fs.writeFileSync(path.join(jobDir, 'meta.json'), JSON.stringify({ files, note, caption: note, url }, null, 2));
+    await say('Got ' + files.length + ' slide(s). Reading the hook, structure, caption style, colours and font, then writing our version with caption and PDF. About 5-10 minutes.');
+    const r = await run('reference.mjs', [jobDir], 30 * 60e3);
+    if (r.code !== 0) throw new Error(r.err.split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 400));
+    const info = JSON.parse(r.out.trim().slice(r.out.indexOf('{')));
+    const post = { no: ++state.seq, id: info.id, dir: info.outDir, topic: info.title, hook: info.hook, keyword: info.keyword, leadmagnet: path.basename(info.pdf || ''), status: 'awaiting_approval', kind: 'reference', look: 'reference', boost: true, reference: { url, pattern: info.pattern, tweak: info.tweak }, createdAt: new Date().toISOString() };
+    state.posts.push(post); save();
+    try { // outside evidence for the learning analyst (a competitor's post is a hypothesis, never our own result)
+      const refs = readJson(path.join(dataDir, 'references.json'), []);
+      const st = readJson(path.join(jobDir, 'style.json'), {});
+      refs.push({ at: new Date().toISOString(), postNo: post.no, source: url || 'screenshots', ownerNote: String(note || '').slice(0, 300), hookText: st.hook_text, hookPattern: st.hook_pattern, slideCount: st.slide_count, ctaType: st.cta?.type, captionStyle: st.caption_style, whyItWorks: st.why_it_works, theme: st.design?.theme_guess });
+      fs.writeFileSync(path.join(dataDir, 'references.json'), JSON.stringify(refs.slice(-40), null, 2));
+    } catch (e) { log('could not save reference evidence:', e.message); }
+    await sendPreview(post);
+    const caption = fs.readFileSync(path.join(post.dir, 'caption.txt'), 'utf8').trim();
+    await say('BUILT FROM YOUR REFERENCE (#' + post.no + ')\nKept from the original: ' + info.pattern + ' | ' + info.slideCount + ' slides | look: ' + [info.look?.font, info.look?.typographic ? 'typographic' : 'photo style'].filter(Boolean).join(', ') + '\nOur tweak: ' + info.tweak + '\nWhy the original works: ' + (info.why || []).slice(0, 3).join('; ') + '\n\nEvery word, image and number is fresh (nothing copied).\nWhen you approve it goes to the front of the queue. At go-live each account gets the post link and the track to add.\n\nCAPTION:\n' + caption);
+  } finally { referenceRunning = false; }
+}
+
+// ---------- results charts (image per account, sent by that account's bot) ----------
+async function sendResults(acct) {
+  const out = path.join(root, 'out', 'reports', 'results-' + acct + '-' + new Date().toISOString().slice(0, 10) + '.png');
+  const r = await run('../renderer/results-image.mjs', [acct, out], 3 * 60e3);
+  if (r.code !== 0) throw new Error(r.err.slice(-200));
+  await photoTo(acct, out, 'Results for @' + (acct === 'main' ? 'faizanali.shahji' : 'exportimportwithfaizan') + ' (the small picture is each post cover)');
+}
+
+// ---------- learning loop ----------
+async function relearn(announce, earlyOnly = false) {
+  const r = await run('learn.mjs', [], 5 * 60e3);
+  if (r.code !== 0) { log('learn failed:', r.err.slice(-200)); return { error: r.err.slice(-200) }; }
+  const out = JSON.parse(r.out.trim().slice(r.out.indexOf('{')));
+  if (announce) { await say(out.report); for (const acct of ['main', 'test']) await sendResults(acct).catch((e) => log('results image failed:', e.message)); }
+  else if (earlyOnly && out.earlyNote && !out.earlyNote.startsWith('Early read not active')) await say(out.earlyNote);
+  return { posts: out.posts, best: out.best };
+}
+
+// ---------- data posts: built from the Comtrade snapshot, no AI-written facts ----------
+async function dataPosts(codes) {
+  const out = [];
+  for (const hs of codes) {
+    const exists = state.posts.find((p) => p.dataHs === hs && p.status !== 'rejected');
+    if (exists) { out.push({ hs, skipped: 'already post #' + exists.no }); continue; }
+    const r = await run('data-post.mjs', [hs]);
+    if (r.code !== 0) { await say(`Data post ${hs} failed: ${r.err.slice(-200)}`); out.push({ hs, error: true }); continue; }
+    const info = JSON.parse(r.out.trim().slice(r.out.indexOf('{')));
+    const post = { no: ++state.seq, id: info.id, dir: info.outDir, topic: info.topic, hook: info.hook, keyword: info.keyword, leadmagnet: path.basename(info.pdf || ''), status: 'awaiting_approval', kind: 'data', dataHs: hs, createdAt: new Date().toISOString() };
+    state.posts.push(post); save();
+    await sendPreview(post);
+    out.push({ hs, no: post.no });
+  }
+  return out;
+}
+
+async function doInsightsSync() {
+  const r = await syncInsights(state); save();
+  try { fs.writeFileSync(path.join(dataDir, 'slot-model.json'), JSON.stringify(buildSlotModel(), null, 2)); } catch (e) { log('slot model failed:', e.message); }
+  for (const m of r.messages) await say(m);
+  // learning loop: new 24h/72h/7d results -> re-learn -> directives for the next generation + bank ranking
+  let learned = null;
+  if (r.updated > 0 || !fs.existsSync(path.join(dataDir, 'learning-model.json'))) learned = await relearn(r.decisive > 0, r.updated > 0 && !(r.decisive > 0)); // full report only for 24h/72h/7d results; h6-only updates send the short early read
+  return { updated: r.updated, messages: r.messages.length, history: r.historyCount, baseline: r.baseline, learned };
+}
+
+// ---------- http ----------
+const server = http.createServer(async (req, res) => {
+  const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  try {
+    if (req.method === 'GET' && req.url === '/health') return send(200, { ok: true, paired: !!state.chatId, bots: { main: !!state.chats.main, test: !!state.chats.test, testConfigured: BOTS.test.hasToken() }, running, posts: state.posts.length });
+    if (req.headers['x-studio-token'] !== STUDIO_TOKEN) return send(401, { error: 'unauthorised' });
+    if (req.method === 'POST' && req.url.startsWith('/daily-run')) { if (req.url.includes('retry=1')) { state.lastDailyRunDate = null; save(); } dailyRun().catch((e) => log('daily run error:', e.message)); return send(202, { started: true }); }
+    if (req.method === 'POST' && req.url.startsWith('/preview/')) { const p = byNo(req.url.split('/')[2]); if (!p) return send(404, { error: 'no such post' }); await sendPreview(p); return send(200, { sent: p.no }); }
+    if (req.method === 'POST' && (req.url === '/feed' || req.url === '/feed?dry=1')) { const out = await runFeed(req.url.endsWith('dry=1')).catch((e) => ({ error: e.message })); return send(200, out); }
+    if (req.method === 'POST' && req.url.startsWith('/data-posts')) { const codes = (new URL(req.url, 'http://x').searchParams.get('hs') || '').split(',').filter(Boolean); dataPosts(codes).then((o) => log('data posts:', JSON.stringify(o))).catch((e) => log('data posts error:', e.message)); return send(202, { started: codes }); }
+    if (req.method === 'POST' && req.url === '/insights-sync') return send(200, await doInsightsSync());
+    if (req.method === 'POST' && req.url.startsWith('/refresh/')) { const nos = req.url.split('/')[2].split(','); const outc = []; for (const n of nos) { const p = byNo(n); if (!p) { outc.push({ no: n, error: 'no such post' }); continue; } try { outc.push(await refreshPost(p)); } catch (e) { outc.push({ no: n, error: e.message }); } } return send(200, outc); }
+    if (req.method === 'POST' && req.url.startsWith('/fix/')) { const u = new URL(req.url, 'http://x'); const [, , no, sl] = u.pathname.split('/'); const p = byNo(no); if (!p) return send(404, { error: 'no such post' }); return send(200, await fixSlide(p, Number(sl), u.searchParams.get('i') || '').catch((e) => ({ error: e.message }))); }
+    if (req.method === 'POST' && req.url.startsWith('/look/')) { const [, , no, name] = req.url.split('/'); const msgs = []; await onLookCommand('/look ' + no + ' ' + (name || ''), async (t) => { msgs.push(t); }); return send(200, msgs); }
+    if (req.method === 'POST' && req.url === '/learn') { const out = await relearn(true); return send(200, out); }
+    if (req.method === 'POST' && req.url.startsWith('/results')) { const acct = new URL(req.url, 'http://x').searchParams.get('acct') || 'main'; await sendResults(acct); return send(200, { sent: acct }); }
+    if (req.method === 'POST' && req.url === '/learn-quiet') { const out = await relearn(false); return send(200, out); }
+    return send(404, { error: 'not found' });
+  } catch (e) { log('http error:', e.message); return send(500, { error: e.message }); }
+});
+
+// ---------- go-live watcher: tells you (Telegram) when Buffer has published a post, with the WhatsApp channel text ready to paste ----------
+const DRIVE_FOLDER = readJson(path.join(dataDir, 'config.json'), {}).driveFolder || ''; // private config (data repo), not in the public code
+const SUPERPROFILE_CONNECTED = ['main']; // accounts connected to Superprofile AutoDM (test is not)
+function channelPostText(p) {
+  const lm = readJson(path.join(dataDir, 'leadmagnets.json'), { magnets: {} }).magnets || {};
+  const link = lm[p.keyword]?.viewLink || DRIVE_FOLDER;
+  let title = p.topic;
+  try { title = readJson(path.join(p.dir, 'leadmagnet.json'), {}).title || title; } catch { /* keep topic */ }
+  return [
+    'FREE GUIDE: ' + title,
+    '',
+    p.hook,
+    '',
+    'Download here: ' + link,
+    '(Comment ' + p.keyword + ' on the Instagram post to get it by DM too.)',
+  ].join('\n');
+}
+let watching = false;
+const CHECK_AFTER_MIN = [3, 25, 60, 180, 360]; // minutes after the due time
+function resetChecksOnStart() { // after a restart, give posts due in the last 48h a fresh set of checks so a missed go-live is announced
+  for (const p of state.posts) for (const e of p.buffer || []) if (!(p.notified || {})[e.bufferId] && e.dueAt && Date.now() - new Date(e.dueAt).getTime() < 48 * 3600e3 && (e.checks || 0) >= CHECK_AFTER_MIN.length) { e.checks = 0; e.lastCheck = 0; }
+  save();
+}
+async function goLiveWatcher() {
+  if (watching || !Object.keys(state.chats).length) return;
+  // Buffer's API is rate limited (24h window): only call it when some scheduled post is due (or overdue) and not yet announced
+  // Each post/channel is checked at most 5 times: 3, 13, 25, 60 and 180 minutes after its due time (min. 10 min apart), then never again by the timer.
+  const due = [];
+  for (const p of state.posts) for (const e of p.buffer || []) {
+    const k = e.checks || 0;
+    if ((p.notified || {})[e.bufferId] || !e.dueAt || k >= CHECK_AFTER_MIN.length) continue;
+    if (Date.now() >= Math.max(new Date(e.dueAt).getTime() + CHECK_AFTER_MIN[k] * 60e3, (e.lastCheck || 0) + 10 * 60e3)) due.push(e);
+  }
+  if (!due.length) return;
+  if ((readJson(path.join(dataDir, 'buffer-cooldown.json'), {}).until || 0) > Date.now()) return; // Buffer rate-limit pause: do not spend a check, ask again after it ends
+  for (const e of due) e.lastCheck = Date.now(); // spacing only; the check is COUNTED below, once Buffer really answered
+  save();
+  watching = true;
+  try {
+    const sent = await sentByIds(due);
+    for (const e of due) e.checks = (e.checks || 0) + 1; save();
+    for (const p of state.posts) {
+      p.notified ||= {};
+      for (const e of p.buffer || []) {
+        const hit = sent.find((x) => x.id === e.bufferId);
+        if (!hit || p.notified[e.bufferId]) continue;
+        const acct = e.account.split(' ')[0];
+        const warn = SUPERPROFILE_CONNECTED.includes(acct) ? '' : '\nNOTE: this account is not connected to Superprofile, so comments here get no auto-DM.';
+        const when = new Date(hit.sentAt).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+        const track = p.musicUsed?.[acct];
+        const link = hit.externalLink || null;
+        p.music ||= {}; p.music[acct] = { added: false, liveAt: hit.sentAt || new Date().toISOString(), bufferId: e.bufferId, link };
+        const stale = Date.now() - new Date(hit.sentAt || Date.now()).getTime() > 3 * 3600e3;
+        const musicLine = stale ? `(Published ${Math.round((Date.now() - new Date(hit.sentAt).getTime()) / 3600e3)} h ago, this alert came late. If you can still add music: Open the post > ... > Edit > Add music${track ? ' > search: ' + track : ''}.)
+
+` : `ADD MUSIC NOW (Instagram's API cannot add it; posts with trending music get more reach, and the first hour matters most):\nOpen the post > ... > Edit > Add music${track ? ' > search: ' + track : ' > pick a trending instrumental'}\n\n`;
+        const channelText = acct === 'main' ? `WhatsApp channel post - copy and paste:\n\n${channelPostText(p)}` : '(WhatsApp channel text is sent by the main bot.)';
+        await sendTo(acct, `LIVE on ${e.account} (published ${when} IST)\n#${p.no} ${p.topic}\n${link || '(link not available yet)'}${warn}\n\n${musicLine}${channelText}`, { reply_markup: musicButtons(p.no, acct, link) });
+        p.notified[e.bufferId] = new Date().toISOString(); save();
+      }
+    }
+  } catch (err) { log('go-live watcher error:', err.message); } finally { watching = false; }
+}
+// one reminder, 40 min after go-live, if the music step has not been confirmed (no Buffer API call needed)
+const musicButtons = (no, acct, link) => ({ inline_keyboard: [...(link && /^https?:/.test(link) ? [[{ text: 'Open the post', url: link }]] : []), [{ text: 'Music added', callback_data: `m:${no}:${acct}` }]] });
+async function musicReminders() {
+  if (!Object.keys(state.chats).length) return;
+  for (const p of state.posts) {
+    for (const [acct, m] of Object.entries(p.music || {})) {
+      if (m.added || m.reminded || !m.liveAt) continue;
+      const age = Date.now() - new Date(m.liveAt).getTime();
+      if (age < 40 * 60e3 || age > 12 * 3600e3) continue;
+      if (!m.link) { try { const hit = (await sentByIds([{ bufferId: m.bufferId }]))[0]; if (hit?.externalLink) m.link = hit.externalLink; } catch { /* Buffer unavailable: fall back to the profile */ } }
+      const handle = acct === 'main' ? 'faizanali.shahji' : 'exportimportwithfaizan';
+      const link = m.link || `https://www.instagram.com/${handle}/`;
+      m.reminded = true; save();
+      await sendTo(acct, `REMINDER: music is not added yet - #${p.no} "${p.topic}" on @${handle}.\nOpen the post: ${link}\nThen ... > Edit > Add music${p.musicUsed?.[acct] ? ' > search: ' + p.musicUsed[acct] : ''}. The first hours decide reach.`, { reply_markup: musicButtons(p.no, acct, m.link || link) });
+    }
+  }
+}
+// catch-up: if today's 11:30 run never happened (laptop was off or asleep, n8n down), run it as soon as the studio is up and it is past 11:30 IST
+function catchUpDaily() {
+  const t = istNow(); const past = t.getUTCHours() > DAILY_AT.h || (t.getUTCHours() === DAILY_AT.h && t.getUTCMinutes() >= DAILY_AT.m + (TICK ? 0 : 5));
+  if (!past || t.getUTCHours() >= 23 || ranToday() || running || !state.chats?.main) return;
+  log('daily run catch-up (it did not run at 11:30 IST today)');
+  dailyRun().catch((e) => log('daily run error:', e.message));
+}
+if (!TICK) {
+setInterval(catchUpDaily, 15 * 60e3);
+setTimeout(catchUpDaily, 90e3);
+setInterval(musicReminders, 5 * 60e3);
+setInterval(goLiveWatcher, 5 * 60e3);
+setTimeout(() => { resetChecksOnStart(); goLiveWatcher(); }, 25e3);
+
+server.listen(PORT, '127.0.0.1', () => { log(`studio listening on http://127.0.0.1:${PORT}`); pollLoop('main'); pollLoop('test');
+  BOTS.main.setCommands([['status', 'Latest posts and go-live times'], ['results', 'Results chart for the main account'], ['run', 'Write new posts now'], ['learn', 'Re-read results, update the plan'], ['hook', 'Plain-English hooks: /hook 17'], ['fresh', 'New hook + design: /fresh 17'], ['fix', 'Rewrite a slide text: /fix 18 2 what you want'], ['look', 'Change design: /look 17'], ['looks', 'List the design looks'], ['ref', 'How to copy a competitor post'], ['help', 'All commands']].map(([command, description]) => ({ command, description }))).catch((e) => log('commands menu:', e.message));
+  if (BOTS.test.hasToken()) BOTS.test.setCommands([{ command: 'status', description: 'Queue of this account' }, { command: 'results', description: 'Results chart' }]).catch(() => {});
+});
+}
+
+// ---------- cloud run (GitHub Actions): scheduler + Telegram polling + watchers in one bounded process ----------
+const FEED_AT = ['08:45', '13:30', '17:30', '22:00'], SYNC_AT = ['03:30', '09:30', '15:30', '21:30']; // IST
+function dueNow(list, tag) { // true once per listed time of day; if several were missed only one run happens
+  const hm = istNow().toISOString().slice(11, 16), day = istDate(); state.sched ||= {};
+  const due = list.filter((x) => hm >= x && !state.sched[tag + '@' + day + '@' + x]);
+  if (!due.length) return false;
+  for (const x of due) state.sched[tag + '@' + day + '@' + x] = true;
+  for (const k of Object.keys(state.sched)) if (!k.includes(day) && k.split('@')[1] < new Date(Date.now() + 5.5 * 3600e3 - 3 * 864e5).toISOString().slice(0, 10)) delete state.sched[k];
+  save(); return true;
+}
+async function pollOnce(who, timeout = 0) {
+  const bot = BOTS[who]; if (!bot.hasToken()) return 0;
+  try {
+    const updates = await bot.getUpdates(state.offsets[who] || 0, timeout);
+    for (const u of updates) {
+      state.offsets[who] = u.update_id + 1;
+      try { if (u.callback_query) { u.callback_query._who = who; await onCallback(u.callback_query); } else if (u.message) await onMessage(u.message, who); }
+      catch (e) { log('handler error:', e.message); }
+    }
+    if (updates.length) save();
+    return updates.length;
+  } catch (e) { log('poll error:', e.message); await sleep(2000); return 0; }
+}
+function flushReference() {
+  const b = state.refBuf; if (!b || Date.now() - (b.at || 0) < 25e3) return;
+  state.refBuf = null; save();
+  bg(startReference(b).catch((e) => say('Reference job failed: ' + e.message)));
+}
+async function runTick() {
+  const deadline = Date.now() + Number(process.env.TICK_SECONDS || 270) * 1000;
+  log('cloud run started; paired chats:', Object.keys(state.chats).join(',') || 'none');
+  resetChecksOnStart();
+  const noSched = process.env.TICK_SKIP_SCHEDULE === '1'; // local test: no scheduled jobs
+  if (!noSched && dueNow(FEED_AT, 'feed')) bg(runFeed().then((o) => log('feed done, queued: ' + (o.fed || []).length)).catch((e) => log('feed error:', e.message)));
+  if (!noSched && dueNow(SYNC_AT, 'sync')) bg(doInsightsSync().then((o) => log('sync done, updated: ' + o.updated)).catch((e) => log('sync error:', e.message)));
+  if (!noSched) catchUpDaily();
+  if (!noSched && dueNow(['04:00'], 'prune')) { const r = pruneImages(state, path.join(root, 'out', 'posts')); log('pruned ' + r.files + ' files, ' + Math.round(r.bytes / 1e6) + ' MB'); save(); }
+  const ym = istDate().slice(0, 7); const doSquash = !noSched && process.env.DATA_REPO_DIR && state.lastSquash !== ym && istNow().getUTCHours() >= 5; if (doSquash) { state.lastSquash = ym; save(); }
+  let lastWatch = 0, lastPersist = 0;
+  while (Date.now() < deadline || bgTasks.size) {
+    for (const who of ['main', 'test']) await pollOnce(who, 8);
+    flushReference();
+    if (Date.now() - lastWatch > 120e3) { await goLiveWatcher(); await musicReminders(); lastWatch = Date.now(); }
+    if (dirty && Date.now() - lastPersist > 15e3) { dirty = false; lastPersist = Date.now(); const r = persist('studio state'); if (r.error) log('persist:', r.error); }
+    if (Date.now() > deadline + 50 * 60e3) { log('giving up on background jobs after 50 min'); break; }
+  }
+  save(); const r = persist('studio state (end of run)'); if (r.error) log('persist:', r.error);
+  if (doSquash) log('history squash:', JSON.stringify(squashHistory()));
+  log('cloud run finished');
+}
+if (TICK) { await runTick(); process.exit(0); }
