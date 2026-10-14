@@ -119,7 +119,10 @@ const log = rd('learning-log.json', []);
 log.push({ at: model.updated, posts: table.length, globalIdx: model.global.mean, best24Main: goal.bestMain24, topFeatures: ranked.slice(0, 3).map(([k, v]) => `${k}:${v.mean}`) });
 wr('learning-log.json', log.slice(-90));
 
-const fmt = (r) => `#${r.no} ${String(r.hook).slice(0, 60)} | main ${r.main24 ?? '-'} / test ${r.test24 ?? '-'} (${r.idx}x)`;
+const fmt = (r) => `#${r.no} ${String(r.hook).slice(0, 60)} | ${r.main24 ?? '-'} views in 24h (${r.idx}x)`; // main bot: main account numbers only
+const fmtT = (r) => `#${r.no} ${String(r.hook).slice(0, 60)} | ${r.test24 ?? '-'} views in 24h`;
+const testRows = table.filter((r) => r.test24 != null).sort((a, b) => b.test24 - a.test24);
+const reportTest = 'RESULTS for @exportimportwithfaizan (24h views)\n' + (testRows.length ? testRows.slice(0, 6).map(fmtT).join('\n') : 'No 24h results yet.');
 const pct = goal.bestMain24 ? Math.round((goal.bestMain24 / GOAL_VIEWS_24H) * 100) : 0;
 const report = [
   `LEARNING REPORT (${table.length} studio posts with 24h results + ${hist.length} older posts of both accounts: ${hist.filter((h) => h.kind === 'post').length} carousels, ${hist.filter((h) => h.kind === 'reel').length} reels)${aiNote}`,
@@ -133,5 +136,5 @@ const report = [
   '', `Next batch mix: ${directives.next_batch_mix?.exploit_pct ?? 70}% proven patterns / ${directives.next_batch_mix?.explore_pct ?? 30}% experiments.`,
 ].join('\n');
 const earlyNote = earlyLines.length ? 'EARLY READ (6h, provisional - ' + pairs.length + ' calibration pairs; the 24h result decides):\n' + earlyLines.join('\n') : (ratio6 ? '' : `Early read not active yet: needs 3 posts with both 6h and 24h numbers (have ${pairs.length}).`);
-console.log(JSON.stringify({ report: report + (earlyLines.length ? '\n\n' + earlyNote : ''), earlyNote, posts: table.length, best: goal.bestMain24 }));
+console.log(JSON.stringify({ report: report + (earlyLines.length ? '\n\n' + earlyNote : ''), earlyNote, reportTest, posts: table.length, best: goal.bestMain24 }));
 process.exit(0); // do not wait for a timed-out Gemini retry loop

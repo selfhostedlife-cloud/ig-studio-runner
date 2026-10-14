@@ -491,7 +491,7 @@ async function relearn(announce, earlyOnly = false) {
   const r = await run('learn.mjs', [], 5 * 60e3);
   if (r.code !== 0) { log('learn failed:', r.err.slice(-200)); return { error: r.err.slice(-200) }; }
   const out = JSON.parse(r.out.trim().slice(r.out.indexOf('{')));
-  if (announce) { await say(out.report); for (const acct of ['main', 'test']) await sendResults(acct).catch((e) => log('results image failed:', e.message)); }
+  if (announce) { await say(out.report); if (out.reportTest) await sendTo('test', out.reportTest); for (const acct of ['main', 'test']) await sendResults(acct).catch((e) => log('results image failed:', e.message)); }
   else if (earlyOnly && out.earlyNote && !out.earlyNote.startsWith('Early read not active')) await say(out.earlyNote);
   return { posts: out.posts, best: out.best };
 }
